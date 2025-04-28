@@ -471,16 +471,17 @@ def pixels_to_3d(curr_data, im, depth, fg_mask):
         torch.linspace(-1, 1, W, device=device),
         indexing='ij'
     )  # [H, W]
-
     # Backproject to camera space
-    x = x * tanfovx
-    y = y * tanfovy
-    z = torch.ones_like(x)
+    # Following standard camera coordinate system convention:
+    # X: right, Y: down, Z: forward
+    x = x * tanfovx  # X axis points right (unchanged)
+    y = -y * tanfovy  # Y axis points down (need negative)
+    z = torch.ones_like(x)  # Z axis points forward (need negative since depth is positive)
 
-    directions = torch.stack((x, -y, -z), dim=0)  # [3, H, W]
+    directions = torch.stack((x, y, z), dim=0)  # [3, H, W]
 
     # Multiply by depth
-    points_camera = directions * depth  # [3, H, W]
+    points_camera = directions * -depth  # [3, H, W]
 
     # Reshape for matrix multiply
     points_camera_h = torch.cat([
@@ -491,7 +492,10 @@ def pixels_to_3d(curr_data, im, depth, fg_mask):
     # Transform to world space
     points_world_h = (viewmatrix @ points_camera_h)  # [4, H*W]
     points_world = points_world_h[:3] / points_world_h[3:]  # [3, H*W]
-
+    scale_matrix = torch.eye(4) * 1
+    scale_matrix = scale_matrix.to(device)
+    points_world = torch.matmul(scale_matrix, points_world_h)[:3]  # [3, H*W]
+    
     # Get corresponding colors
     colors = im.view(3, -1)  # [3, H*W]
 
@@ -551,7 +555,7 @@ def get_changes(prev_params, prev_dataset, curr_dataset):
         flow_viz = flow_utils.flow_to_rgb(flow)  # Represent the flow as RGB colors
         
         # Get 3D points for current frame
-        points = pixels_to_3d(curr_data, curr_data['im'], prop_depth, fg_mask)
+        points = pixels_to_3d(prev_data, prev_data['im'], depth, fg_mask > -10)
         
         # Add camera ID as a fourth dimension to help distinguish points from different views
         # Create a tensor with camera ID
@@ -564,7 +568,7 @@ def get_changes(prev_params, prev_dataset, curr_dataset):
         all_points_list.append(points_with_id)
         
         print(f"Added {points.shape[0]} points from camera {i}")
-        if i == 1:
+        if i == 4:
             break
     
     # Concatenate all points from different frames
@@ -634,14 +638,15 @@ def visualize_point_cloud(points, seq="unknown"):
                                      height=768,
                                      point_show_normal=False)
     
-    # Visualize the point cloud with camera-based coloring                                 
-    if points_np.shape[1] >= 7:
-        print(f"Visualizing {len(points_np)} points in 3D with camera-based colors")
-        o3d.visualization.draw_geometries([pcd_cameras, coordinate_frame], 
-                                         window_name=f"3D Points (Camera Colors) - {seq}",
-                                         width=1024, 
-                                         height=768,
-                                         point_show_normal=False)
+    # Visualize the point cloud with camera-based coloring            
+    if False:                     
+        if points_np.shape[1] >= 7:
+            print(f"Visualizing {len(points_np)} points in 3D with camera-based colors")
+            o3d.visualization.draw_geometries([pcd_cameras, coordinate_frame], 
+                                            window_name=f"3D Points (Camera Colors) - {seq}",
+                                            width=1024, 
+                                            height=768,
+                                            point_show_normal=False)
 
 def train(seq, exp):
     md = json.load(open(f"/home/anurag/Datasets/dynamic/data/{seq}/train_meta.json", 'r'))  # metadata
