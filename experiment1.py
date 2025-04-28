@@ -12,6 +12,10 @@ from helpers import setup_camera, l1_loss_v1, l1_loss_v2, weighted_l2_loss_v1, w
 from external import calc_ssim, calc_psnr, build_rotation, densify, update_params_and_optimizer
 
 
+import ptlflow
+import cv2
+from ptlflow.utils import flow_utils
+
 def get_dataset(t, md, seq):
     dataset = []
     for c in range(len(md['fn'][t])):
@@ -183,12 +187,265 @@ def report_progress(params, data, i, progress_bar, every_i=100):
         progress_bar.set_postfix({"train img 0 PSNR": f"{psnr:.{7}f}"})
         progress_bar.update(every_i)
 
-def get_changes(prev_params, prev_data, curr_data):
+
+def process_input_for_flow(prev_dataset, curr_dataset):
+    combined = []
+    for prev, curr in zip(prev_dataset, curr_dataset):
+        pair = torch.stack([prev['im'], curr['im']], dim=0)
+        combined.append(pair)
+    return {"images":torch.stack(combined, dim=0)}
+    
+import torch.nn.functional as F
+
+def frame_difference_background_removal(background, frame, threshold=3):
+    """
+    Args:
+        background: [C, H, W] tensor (reference background)
+        frame: [C, H, W] tensor (current frame)
+        threshold: float (threshold to detect moving areas)
+
+    Returns:
+        fg_mask: [1, H, W] tensor (binary mask of foreground)
+        foreground: [C, H, W] tensor (foreground frame)
+    """
+    # Convert to grayscale if input is RGB
+    if background.shape[0] == 3:
+        background_gray = 0.2989 * background[0] + 0.5870 * background[1] + 0.1140 * background[2]
+        frame_gray = 0.2989 * frame[0] + 0.5870 * frame[1] + 0.1140 * frame[2]
+    else:
+        background_gray = background[0]
+        frame_gray = frame[0]
+
+    # Apply Gaussian blur (optional: helps reduce noise)
+    background_gray = F.avg_pool2d(background_gray.unsqueeze(0).unsqueeze(0), 5, stride=1, padding=2).squeeze(0).squeeze(0)
+    frame_gray = F.avg_pool2d(frame_gray.unsqueeze(0).unsqueeze(0), 5, stride=1, padding=2).squeeze(0).squeeze(0)
+
+    # Absolute difference
+    diff = frame_gray - background_gray
+
+    # Threshold to create foreground mask
+    fg_mask = (diff > (threshold / 255.0)).float()  # threshold normalized to [0, 1]
+
+    # Optionally clean small noise with morphological operations (erosion-dilation)
+    fg_mask = F.max_pool2d(fg_mask.unsqueeze(0).unsqueeze(0), kernel_size=3, stride=1, padding=1).squeeze(0).squeeze(0)
+
+    # Apply mask to frame
+    foreground = frame * fg_mask.unsqueeze(0)
+
+    return fg_mask.unsqueeze(0), foreground
+
+def warp_depth_with_flow(depth, flow, normalized=True):
+    """
+    Warp a depth image using flow.
+    
+    Args:
+        depth: [1, H, W] tensor
+        flow: [2, H, W] tensor
+        normalized: bool, whether flow is already normalized to [-1, 1]
+        
+    Returns:
+        warped_depth: [1, H, W] tensor
+    """
+    h, w = depth.shape[1], depth.shape[2]
+
+    # Create normalized meshgrid [-1, 1]
+    grid_y, grid_x = torch.meshgrid(
+        torch.linspace(-1, 1, h, device=depth.device),
+        torch.linspace(-1, 1, w, device=depth.device),
+        indexing='ij'
+    )
+    base_grid = torch.stack((grid_x, grid_y), dim=2)  # [H, W, 2]
+
+    if not normalized:
+        # Flow is in pixels, normalize it
+        flow_x = flow[0] / (w / 2)
+        flow_y = flow[1] / (h / 2)
+    else:
+        # Flow is already normalized
+        flow_x = flow[0]
+        flow_y = flow[1]
+
+    normalized_flow = torch.stack((flow_x, flow_y), dim=2)  # [H, W, 2]
+
+    # Add flow to base grid
+    sampling_grid = base_grid + normalized_flow  # [H, W, 2]
+    sampling_grid = sampling_grid.unsqueeze(0)   # [1, H, W, 2]
+
+    # Prepare depth for sampling
+    depth = depth.unsqueeze(0)  # [1, 1, H, W]
+
+    # Grid sample
+    warped_depth = F.grid_sample(
+        depth,
+        sampling_grid,
+        mode='bilinear',
+        padding_mode='zeros',
+        align_corners=True
+    )
+
+    return warped_depth.squeeze(0)  # [1, H, W]
+
+def get_frame_differnce_from_flow(flow, threshold=1.5):
+    """
+    Convert flow to frame difference.
+    
+    Args:
+        flow: [2, H, W] tensor
+        
+    Returns:
+        frame_diff: [1, H, W] tensor
+    """
+    # Compute the sum of squares of the flow components
+    flow_magnitude_squared = flow[0,:,:]**2 + flow[1,:,:]**2
+
+    # Threshold the flow magnitude
+    frame_diff = (flow_magnitude_squared > threshold).float()  # Convert to binary mask
+    frame_diff = frame_diff.unsqueeze(0)
+    print(frame_diff.shape)
+    return frame_diff  # [1, H, W]
+
+
+def apply_flow_torch(image: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
+    """
+    Applies optical flow to an image using PyTorch tensors.
+
+    Args:
+        image: A PyTorch tensor of shape [C, H, W] representing the image, where C is 1 for grayscale
+               or 3 for RGB.
+        flow: A PyTorch tensor of shape [2, H, W] representing the optical flow.
+              flow[0, y, x] is the horizontal (x) displacement at pixel (x, y).
+              flow[1, y, x] is the vertical (y) displacement at pixel (x, y).
+
+    Returns:
+        A PyTorch tensor of shape [C, H, W] representing the warped image.
+        Pixels that flow outside the image boundaries are set to 0.
+    """
+    # Check input tensor shapes
+    if image.ndim != 3 or (image.shape[0] != 3 and image.shape[0] != 1):
+        raise ValueError(f"Image tensor should have shape [C, H, W] (C=1 or 3), but got {image.shape}")
+    if flow.ndim != 3 or flow.shape[0] != 2 or flow.shape[1:] != image.shape[1:]:
+        raise ValueError(f"Flow tensor should have shape [2, H, W], but got {flow.shape}")
+
+    channels, height, width = image.shape
+    device = image.device
+    # Create a meshgrid of (x, y) coordinates
+    x = torch.arange(width, device=device).float()
+    y = torch.arange(height, device=device).float()
+    # meshgrid returns once the x values for all rows and once the y values for all columns
+    # X and Y will contain the x,y coordinates for each pixel
+    X, Y = torch.meshgrid(x, y, indexing='xy') # indexing='xy' is crucial for correct flow application
+    # Add the flow to the original coordinates to find the source coordinates
+    src_x = X + flow[0, :, :]
+    src_y = Y + flow[1, :, :]
+
+    # Clip source coordinates to stay within image bounds.  Values outside the range become 0
+    src_x = torch.clamp(src_x, 0, width - 1)
+    src_y = torch.clamp(src_y, 0, height - 1)
+
+    # Use grid_sample to perform the warping
+    # grid_sample requires the input coordinates to be in the range [-1, 1].
+    # Normalize the source coordinates to this range.
+    src_x_norm = 2 * (src_x / (width - 1)) - 1
+    src_y_norm = 2 * (src_y / (height - 1)) - 1
+
+    # Create the grid for grid_sample. grid shape = (1, H, W, 2)
+    grid = torch.stack((src_x_norm, src_y_norm), dim=-1).unsqueeze(0)
+
+    # grid_sample performs the warping, using bilinear interpolation.
+    warped_image = torch.nn.functional.grid_sample(
+        image.unsqueeze(0).float(), # Input needs to be 4D (N, C, H, W).
+        grid,
+        mode='bilinear',
+        padding_mode='zeros',  # Use 'zeros' padding to handle out-of-bounds
+        align_corners=True # align_corners=True is crucial for getting the correct behavior
+    )[0].int() #Return to int and remove batch dimension
+
+
+    return warped_image
+
+    
+def get_changes(prev_params, prev_dataset, curr_dataset):
     rendervar = params2rendervar(prev_params)
     rendervar['means2D'].retain_grad()
-    im, radius, depth = Renderer(raster_settings=curr_data['cam'])(**rendervar)
+    processed_for_flow = process_input_for_flow(prev_dataset, curr_dataset)
+    model = ptlflow.get_model("raft", ckpt_path="things")
+    model = model.cuda()
+    model.eval()
+    for i in range(len(curr_dataset)):
+        curr_data = curr_dataset[i]
+        prev_data = prev_dataset[i]
+        im, radius, depth = Renderer(raster_settings=prev_data['cam'])(**rendervar)
+        seg = curr_data['seg']
+        # process_input_for_flow(prev_data, curr_data)
+        predictions = model({"images": torch.stack([curr_data['im'], prev_data['im']], dim=0).unsqueeze(0)})
+        # print('------', predictions["flows"].shape, predictions["flows"].dtype)  # Should be (1, 2, H, W, C) where H and W are the height and width of the images
+        flow = predictions["flows"][0, 0]
+        # print(depth.shape, flow.shape)
+        prop_depth = apply_flow_torch(depth, flow)
+        fg_mask = get_frame_differnce_from_flow(flow)
+        print(f"im shape: {im.shape}, ({im.dtype})")
+        print(f"seg shape: {seg.shape}, ({seg.dtype})")
+        print(f"depth shape: {depth.shape}, ({depth.dtype})")
+        print(f"flow shape: {flow.shape}, ({flow.dtype})")
+        print(f"prop_depth shape: {prop_depth.shape}, ({prop_depth.dtype})")
+        import matplotlib.pyplot as plt
+
+        # Convert tensors to CPU and numpy for visualization
+        prev_im_np = prev_data['im'].permute(1, 2, 0).detach().cpu().numpy()
+        curr_im_np = curr_data['im'].permute(1, 2, 0).detach().cpu().numpy()
+        prev_depth = depth.squeeze(0).detach().cpu().numpy()
+        curr_depth = prop_depth.squeeze(0).detach().cpu().numpy()
+        fg_mask_np = fg_mask.squeeze(0).detach().cpu().numpy() > 0.5
+        
+        curr_depth_corrected = np.where(fg_mask_np, curr_depth, 1)
+        curr_masked_image = np.where(np.expand_dims(fg_mask_np, axis=2), curr_im_np, 0)
+        flow = flow.permute(1, 2, 0).detach().cpu().numpy()
+        flow_viz = flow_utils.flow_to_rgb(flow)  # Represent the flow as RGB colors
+        
+        
+        
+        
+        
+        # Visualize the images
+        fig, axs = plt.subplots(2, 5, figsize=(20, 5))
+        
+        axs[0][0].imshow(prev_im_np)
+        axs[0][0].set_title("prev_im_np")
+        axs[0][0].axis("off")
+        
+        axs[0][1].imshow(prev_depth, cmap="viridis")
+        axs[0][1].set_title("prev_depth")
+        axs[0][1].axis("off")
+        
+        axs[1][0].imshow(curr_im_np)
+        axs[1][0].set_title("curr_im_np")
+        axs[1][0].axis("off")
+        
+        axs[1][1].imshow(curr_depth_corrected, cmap="viridis")
+        axs[1][1].set_title("curr_depth_corrected")
+        axs[1][1].axis("off")
+        
+        axs[1][2].imshow(fg_mask_np, cmap="Greys")
+        axs[1][2].set_title("fg_mask_np")
+        axs[1][2].axis("off")
+        
+        axs[1][3].imshow(curr_masked_image)
+        axs[1][3].set_title("curr_masked_image")
+        axs[1][3].axis("off")
+        
+        axs[1][4].imshow(flow_viz)
+        axs[1][4].set_title("flow_viz")
+        axs[1][4].axis("off")
     
-    seg = curr_data['seg']
+
+        plt.tight_layout()
+        plt.show()
+        break
+
+    
+    
+    
+    
     
     
 def train(seq, exp):
@@ -218,14 +475,13 @@ def train(seq, exp):
                 prev_params[key] = torch.nn.Parameter(params_from_saved[key].contiguous().requires_grad_(True))
     else:
         pass
-    print(len(saved_params['means3D']))
+    # print(len(saved_params['means3D']))
     
-    dataset = get_dataset(0, md, seq)
-    todo_dataset = []
-    prev_data = get_batch(todo_dataset, dataset)
-    dataset = get_dataset(1, md, seq)
-    curr_data = get_batch(todo_dataset, dataset)
-    get_changes(prev_params, prev_data, curr_data)
+    prev_dataset = get_dataset(0, md, seq)
+    curr_dataset = get_dataset(1, md, seq)
+    get_changes(prev_params, prev_dataset, curr_dataset)
+    
+    
 
 
 if __name__ == "__main__":
