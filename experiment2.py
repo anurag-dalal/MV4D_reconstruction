@@ -279,7 +279,7 @@ def warp_depth_with_flow(depth, flow, normalized=True):
     warped_depth = F.grid_sample(
         depth,
         sampling_grid,
-        mode='bilinear',
+        mode='nearest',
         padding_mode='zeros',
         align_corners=True
     )
@@ -302,7 +302,7 @@ def get_frame_differnce_from_flow(flow, threshold=1.5):
     # Threshold the flow magnitude
     frame_diff = (flow_magnitude_squared > threshold).float()  # Convert to binary mask
     frame_diff = frame_diff.unsqueeze(0)
-    print(frame_diff.shape)
+    # print(frame_diff.shape)
     return frame_diff  # [1, H, W]
 
 
@@ -356,10 +356,10 @@ def apply_flow_torch(image: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
     warped_image = torch.nn.functional.grid_sample(
         image.unsqueeze(0).float(), # Input needs to be 4D (N, C, H, W).
         grid,
-        mode='bilinear',
+        mode='nearest',
         padding_mode='zeros',  # Use 'zeros' padding to handle out-of-bounds
         align_corners=True # align_corners=True is crucial for getting the correct behavior
-    )[0].int() #Return to int and remove batch dimension
+    )[0] #Return to int and remove batch dimension
 
 
     return warped_image
@@ -443,7 +443,154 @@ def get_3d_coordinates(
         points_and_colors = points_and_colors[mask] # Shape: [N, 6]
 
     return points_and_colors
+def get_camera_matrices(
+    image_height: int,
+    image_width: int,
+    tanfovx: float,
+    tanfovy: float,
+    viewmatrix: torch.Tensor,
+    projmatrix: torch.Tensor,
+    campos: torch.Tensor
+):
+    """
+    Calculates the camera-to-world transformation matrix and projection matrix
+    from the given camera parameters.  Handles potential issues with input
+    tensor shapes.
 
+    Args:
+        image_height: Height of the image.
+        image_width: Width of the image.
+        tanfovx: Tangent of the horizontal field of view.
+        tanfovy: Tangent of the vertical field of view.
+        viewmatrix: The view matrix (4x4).  Expected shape: (1, 4, 4) or (4, 4).
+        projmatrix: The projection matrix (4x4). Expected shape: (1, 4, 4) or (4, 4).
+        campos: Camera position (3D coordinates). Expected shape: (3,)
+
+    Returns:
+        camera_to_world: A 4x4 PyTorch tensor representing the transformation
+            from camera to world coordinates.
+        projection_matrix: A 4x4 PyTorch tensor representing the projection matrix.
+    """
+
+    # --- Input Validation and Handling ---
+    # Ensure viewmatrix and projmatrix are 4x4
+    if viewmatrix.ndim == 3:
+        if viewmatrix.shape[0] != 1 or viewmatrix.shape[1:] != (4, 4):
+            raise ValueError(
+                "viewmatrix should have shape (1, 4, 4) or (4, 4), but got"
+                f" {viewmatrix.shape}"
+            )
+        viewmatrix = viewmatrix.squeeze(0)  # Remove the batch dimension
+    elif viewmatrix.shape != (4, 4):
+        raise ValueError(
+            "viewmatrix should have shape (1, 4, 4) or (4, 4), but got"
+            f" {viewmatrix.shape}"
+        )
+
+    if projmatrix.ndim == 3:
+        if projmatrix.shape[0] != 1 or projmatrix.shape[1:] != (4, 4):
+            raise ValueError(
+                "projmatrix should have shape (1, 4, 4) or (4, 4), but got"
+                f" {projmatrix.shape}"
+            )
+        projmatrix = projmatrix.squeeze(0)  # Remove the batch dimension
+    elif projmatrix.shape != (4, 4):
+        raise ValueError(
+            "projmatrix should have shape (1, 4, 4) or (4, 4), but got"
+            f" {projmatrix.shape}"
+        )
+    if campos.shape != (3,):
+        raise ValueError(f"campos should have shape (3,), but got {campos.shape}")
+
+    # --- Calculations ---
+    camera_to_world = torch.inverse(viewmatrix)  # Camera-to-world transformation
+
+    projection_matrix = projmatrix
+
+    return camera_to_world, projection_matrix
+
+
+def get_scale_matrix(sx: float, sy: float, sz: float) -> torch.Tensor:
+    """
+    Generates a 4x4 scale matrix.
+
+    Args:
+        sx: Scaling factor along the x-axis.
+        sy: Scaling factor along the y-axis.
+        sz: Scaling factor along the z-axis.
+
+    Returns:
+        A 4x4 PyTorch tensor representing the scale matrix.
+    """
+    scale_matrix = torch.eye(4)  # Start with a 4x4 identity matrix
+    scale_matrix[0, 0] = sx
+    scale_matrix[1, 1] = sy
+    scale_matrix[2, 2] = sz
+    return scale_matrix
+
+
+
+def pixels_to_3d2(curr_data, im, depth, fg_mask):
+    """
+    Args:
+        curr_data: dictionary containing camera settings (GaussianRasterizationSettings)
+        im: [3, H, W] image tensor (colors)
+        depth: [1, H, W] depth map tensor
+        fg_mask: [1, H, W] foreground mask (values >0 are foreground)
+
+    Returns:
+        points_3d_rgb: [N, 6] tensor (X, Y, Z, R, G, B) in world coordinates,
+                       where N is the number of foreground pixels.
+    """
+    camera_to_world, projection_matrix = get_camera_matrices(
+        curr_data.image_height,
+        curr_data.image_width,
+        curr_data.tanfovx,
+        curr_data.tanfovy,
+        curr_data.viewmatrix,
+        curr_data.projmatrix,
+        curr_data.campos,
+    )
+
+    _, height, width = im.shape
+    device = im.device
+
+    # Create a meshgrid of pixel coordinates (x, y)
+    x = torch.arange(width, device=device).float()
+    y = torch.arange(height, device=device).float()
+    X, Y = torch.meshgrid(x, y, indexing='xy')
+
+    # Normalize pixel coordinates to NDC
+    x_ndc = (2 * X / (width - 1) - 1)
+    y_ndc = (2 * Y / (height - 1) - 1)
+
+    # Back-project from NDC to camera space
+    x_camera = x_ndc * depth[0, :, :] / curr_data.tanfovx
+    y_camera = y_ndc * depth[0, :, :] / curr_data.tanfovy
+    z_camera = depth[0, :, :]
+    points_camera = torch.stack((x_camera, y_camera, z_camera), dim=-1)  # [H, W, 3]
+
+    # Convert to homogeneous coordinates
+    ones = torch.ones((height, width, 1), device=device)
+    points_camera_homogeneous = torch.cat((points_camera, ones), dim=-1)  # [H, W, 4]
+
+    # Transform to world space
+    points_world_homogeneous = torch.einsum(
+        "hwc,cd->hwd", points_camera_homogeneous, camera_to_world
+    )
+    points_world = points_world_homogeneous[..., :3]  # [H, W, 3]
+
+    # Extract colors
+    colors = im.permute(1, 2, 0)  # [H, W, 3]
+
+    # Concatenate points and colors
+    points_3d_rgb = torch.cat((points_world, colors), dim=-1)  # [H, W, 6]
+
+    # Apply mask
+    fg_mask_bool = fg_mask[0].bool()  # [H, W]
+    points_3d_rgb_masked = points_3d_rgb[fg_mask_bool]  # [N, 6]
+
+    return points_3d_rgb_masked
 def pixels_to_3d(curr_data, im, depth, fg_mask):
     """
     Args:
@@ -475,13 +622,13 @@ def pixels_to_3d(curr_data, im, depth, fg_mask):
     # Following standard camera coordinate system convention:
     # X: right, Y: down, Z: forward
     x = x * tanfovx  # X axis points right (unchanged)
-    y = -y * tanfovy  # Y axis points down (need negative)
+    y = y * tanfovy  # Y axis points down (need negative)
     z = torch.ones_like(x)  # Z axis points forward (need negative since depth is positive)
 
     directions = torch.stack((x, y, z), dim=0)  # [3, H, W]
 
     # Multiply by depth
-    points_camera = directions * -depth  # [3, H, W]
+    points_camera = directions * depth  # [3, H, W]
 
     # Reshape for matrix multiply
     points_camera_h = torch.cat([
@@ -490,11 +637,15 @@ def pixels_to_3d(curr_data, im, depth, fg_mask):
     ], dim=0)  # [4, H*W]
 
     # Transform to world space
-    points_world_h = (viewmatrix @ points_camera_h)  # [4, H*W]
-    points_world = points_world_h[:3] / points_world_h[3:]  # [3, H*W]
-    scale_matrix = torch.eye(4) * 1
-    scale_matrix = scale_matrix.to(device)
-    points_world = torch.matmul(scale_matrix, points_world_h)[:3]  # [3, H*W]
+    # points_world_h = (viewmatrix @ points_camera_h)  # [4, H*W]
+    # points_world = points_world_h[:3] / points_world_h[3:]  # [3, H*W]
+    # scale_matrix = torch.eye(4) * 1
+    # scale_matrix = scale_matrix.to(device)
+    # points_world = torch.matmul(scale_matrix, points_world_h)[:3]  # [3, H*W]
+    campos = curr_data['cam'].campos  # [3]
+    campos_h = torch.cat([campos, torch.tensor([1.0], device=campos.device)])  # [4]
+    points_world_h = (viewmatrix @ points_camera_h) + campos_h.view(4, 1)  # [4, H*W]
+    points_world = points_world_h[:3] # / points_world_h[3:]  # [3, H*W]
     
     # Get corresponding colors
     colors = im.view(3, -1)  # [3, H*W]
@@ -509,7 +660,75 @@ def pixels_to_3d(curr_data, im, depth, fg_mask):
     points_3d_rgb = torch.cat([points_world, colors], dim=0).transpose(0, 1)  # [N, 6]
 
     return points_3d_rgb
-    
+
+import torch
+
+def pixels_to_3d3(curr_data, im, depth, fg_mask):
+    """
+    Projects image pixels with depth into 3D world space.
+
+    Args:
+        curr_data['cam']: camera settings (GaussianRasterizationSettings)
+        im: [3, H, W] image tensor (RGB colors)
+        depth: [1, H, W] depth map tensor (Z-depth in camera space)
+        fg_mask: [1, H, W] foreground mask (values >0 are foreground)
+
+    Returns:
+        points_3d_rgb: [N, 6] tensor (X, Y, Z, R, G, B)
+    """
+    # Unpack camera parameters
+    H = curr_data['cam'].image_height
+    W = curr_data['cam'].image_width
+    tanfovx = curr_data['cam'].tanfovx
+    tanfovy = curr_data['cam'].tanfovy
+    viewmatrix = curr_data['cam'].viewmatrix.squeeze(0)  # [4, 4]
+
+    device = im.device
+
+    # Create pixel grid in normalized device coordinates [-1, 1]
+    y, x = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=device),
+        torch.linspace(-1, 1, W, device=device),
+        indexing='ij'
+    )  # [H, W]
+
+    # Backproject to camera space using intrinsics approximation
+    # Camera convention: X (right), Y (down), Z (forward)
+    x = -x * tanfovx  # X-right (negate due to convention)
+    y = y * tanfovy   # Y-down
+    z = torch.ones_like(x)  # Z-forward
+
+    directions = torch.stack((x, y, z), dim=0)  # [3, H, W]
+
+    # Scale directions by depth
+    points_camera = directions * depth  # [3, H, W]
+
+    # Homogenize for transformation
+    points_camera_h = torch.cat([
+        points_camera.view(3, -1),                   # [3, H*W]
+        torch.ones(1, H * W, device=device)          # [1, H*W]
+    ], dim=0)  # [4, H*W]
+
+    # Invert view matrix to get camera-to-world transform
+    viewmatrix_inv = torch.inverse(viewmatrix)  # [4, 4]
+
+    # Transform points to world space
+    points_world_h = viewmatrix_inv @ points_camera_h  # [4, H*W]
+    points_world = points_world_h[:3] / points_world_h[3:]  # [3, H*W]
+
+    # Get image colors
+    colors = im.view(3, -1)  # [3, H*W]
+
+    # Apply foreground mask
+    mask = (fg_mask > 0).view(-1)  # [H*W]
+    points_world = points_world[:, mask]  # [3, N]
+    colors = colors[:, mask]              # [3, N]
+
+    # Combine into [N, 6] (XYZRGB)
+    points_3d_rgb = torch.cat([points_world, colors], dim=0).transpose(0, 1)  # [N, 6]
+
+    return points_3d_rgb
+
 def get_changes(prev_params, prev_dataset, curr_dataset):
     rendervar = params2rendervar(prev_params)
     rendervar['means2D'].retain_grad()
@@ -520,7 +739,8 @@ def get_changes(prev_params, prev_dataset, curr_dataset):
     
     # Initialize a list to collect all points from different frames
     all_points_list = []
-    
+    import time
+    start = time.time()
     for i in range(len(curr_dataset)):
         curr_data = curr_dataset[i]
         prev_data = prev_dataset[i]
@@ -528,34 +748,38 @@ def get_changes(prev_params, prev_dataset, curr_dataset):
         seg = curr_data['seg']
         
         # Get optical flow
-        predictions = model({"images": torch.stack([curr_data['im'], prev_data['im']], dim=0).unsqueeze(0)})
-        flow = predictions["flows"][0, 0]
+        with torch.no_grad():
+            predictions = model({"images": torch.stack([curr_data['im'], prev_data['im']], dim=0).unsqueeze(0)})
+            flow = predictions["flows"][0, 0]
         
         # Apply flow to depth
         prop_depth = apply_flow_torch(depth, flow)
         fg_mask = get_frame_differnce_from_flow(flow)
         
-        print(f"Processing frame {i}...")
-        print(f"im shape: {im.shape}, ({im.dtype})")
-        print(f"seg shape: {seg.shape}, ({seg.dtype})")
-        print(f"depth shape: {depth.shape}, ({depth.dtype})")
-        print(f"flow shape: {flow.shape}, ({flow.dtype})")
-        print(f"prop_depth shape: {prop_depth.shape}, ({prop_depth.dtype})")
+        # print(f"Processing frame {i}...")
+        # print(f"im shape: {im.shape}, ({im.dtype})")
+        # print(f"seg shape: {seg.shape}, ({seg.dtype})")
+        # print(f"depth shape: {depth.shape}, ({depth.dtype})")
+        # print(f"flow shape: {flow.shape}, ({flow.dtype})")
+        # print(f"prop_depth shape: {prop_depth.shape}, ({prop_depth.dtype})")
         
         # Convert tensors to CPU and numpy for visualization
-        prev_im_np = prev_data['im'].permute(1, 2, 0).detach().cpu().numpy()
-        curr_im_np = curr_data['im'].permute(1, 2, 0).detach().cpu().numpy()
-        prev_depth = depth.squeeze(0).detach().cpu().numpy()
-        curr_depth = prop_depth.squeeze(0).detach().cpu().numpy()
-        fg_mask_np = fg_mask.squeeze(0).detach().cpu().numpy() > 0.5
+        # prev_im_np = prev_data['im'].permute(1, 2, 0).detach().cpu().numpy()
+        # curr_im_np = curr_data['im'].permute(1, 2, 0).detach().cpu().numpy()
+        # prev_depth = depth.squeeze(0).detach().cpu().numpy()
+        # curr_depth = prop_depth.squeeze(0).detach().cpu().numpy()
+        # fg_mask_np = fg_mask.squeeze(0).detach().cpu().numpy() > 0.5
         
-        curr_depth_corrected = np.where(fg_mask_np, curr_depth, 1)
-        curr_masked_image = np.where(np.expand_dims(fg_mask_np, axis=2), curr_im_np, 0)
-        flow = flow.permute(1, 2, 0).detach().cpu().numpy()
-        flow_viz = flow_utils.flow_to_rgb(flow)  # Represent the flow as RGB colors
+        # curr_depth_corrected = np.where(fg_mask_np, curr_depth, 1)
+        # curr_masked_image = np.where(np.expand_dims(fg_mask_np, axis=2), curr_im_np, 0)
+        # flow = flow.permute(1, 2, 0).detach().cpu().numpy()
+        # flow_viz = flow_utils.flow_to_rgb(flow)  # Represent the flow as RGB colors
         
         # Get 3D points for current frame
-        points = pixels_to_3d(prev_data, prev_data['im'], depth, fg_mask > -10)
+        # points = pixels_to_3d3(prev_data, prev_data['im'], depth, fg_mask > -10)
+        points = pixels_to_3d(curr_data, curr_data['im'], prop_depth, fg_mask)
+        # points = pixels_to_3d(prev_data, prev_data['im'], depth, fg_mask)
+        # points = pixels_to_3d2(prev_data['cam'], prev_data['im'], depth, fg_mask > -10)
         
         # Add camera ID as a fourth dimension to help distinguish points from different views
         # Create a tensor with camera ID
@@ -568,10 +792,13 @@ def get_changes(prev_params, prev_dataset, curr_dataset):
         all_points_list.append(points_with_id)
         
         print(f"Added {points.shape[0]} points from camera {i}")
-        if i == 4:
-            break
-    
+        # print(curr_dataset[i]['cam'])
+        # Clear memory and remove unwanted variables
+        del im, radius, depth, seg, flow, prop_depth, fg_mask, points, points_with_id
+        torch.cuda.empty_cache()
     # Concatenate all points from different frames
+    end = time.time()
+    print(f"Time taken to process all frames: {end - start:.2f} seconds")
     if all_points_list:
         all_points = torch.cat(all_points_list, dim=0)
         print(f"Total points collected: {all_points.shape[0]}")

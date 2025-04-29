@@ -355,10 +355,10 @@ def apply_flow_torch(image: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
     warped_image = torch.nn.functional.grid_sample(
         image.unsqueeze(0).float(), # Input needs to be 4D (N, C, H, W).
         grid,
-        mode='bilinear',
+        mode='nearest',
         padding_mode='zeros',  # Use 'zeros' padding to handle out-of-bounds
         align_corners=True # align_corners=True is crucial for getting the correct behavior
-    )[0].int() #Return to int and remove batch dimension
+    )[0] #Return to int and remove batch dimension
 
 
     return warped_image
