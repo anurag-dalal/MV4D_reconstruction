@@ -350,6 +350,7 @@ class DynamicSceneViewer(tk.Tk):
         prev_data = prev_dataset[camera_idx]
         
         # Render the scene
+        print(prev_data['cam'])
         im, radius, depth = Renderer(raster_settings=prev_data['cam'])(**rendervar)
         
         # Get optical flow

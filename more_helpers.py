@@ -259,7 +259,11 @@ def remove_low_density_points_in_grid(points, grid_size=0.08, k=27):
 # This function collects points from the previous and current datasets.
 # It uses the Gaussian rasterizer to render the points and applies optical flow to propagate depth.
 # The function also filters out low-density points using a grid-based approach.
+# need downsmpling of points, cause too many points to render gpu out of memory
+# strategy 1 select only n number of cameras
 def get_changes(prev_params, prev_dataset, curr_dataset, flowmodel):
+    
+    cameras_to_select = [0, 1, 2, 4, 8, 12, 16, 20, 24]
     rendervar = params2rendervar(prev_params)
     rendervar['means2D'].retain_grad()
     processed_for_flow = process_input_for_flow(prev_dataset, curr_dataset)
@@ -270,6 +274,7 @@ def get_changes(prev_params, prev_dataset, curr_dataset, flowmodel):
     # Initialize a list to collect all points from different frames
     all_points_list = []
     for i in range(len(curr_dataset)):
+    # for i in cameras_to_select:
         curr_data = curr_dataset[i]
         prev_data = prev_dataset[i]
         
@@ -284,6 +289,11 @@ def get_changes(prev_params, prev_dataset, curr_dataset, flowmodel):
         prop_depth = apply_flow_torch(depth, flow)
         fg_mask = get_frame_differnce_from_flow(flow)    
         points = pixels_to_3d(curr_data, curr_data['im'], prop_depth, fg_mask)
+        
+        # Create masked version of current image by applying foreground mask
+        # Equivalent to: curr_masked_image = np.where(np.expand_dims(fg_mask_np, axis=2), curr_im_np, 0)
+        # For torch: We need to expand fg_mask to match image dimensions and use it for masking
+        curr_masked_image = curr_data['im'] * fg_mask  # Broadcasting will expand fg_mask across the channel dimension
         
         # Add camera ID as a fourth dimension to help distinguish points from different views
         # Create a tensor with camera ID
@@ -301,19 +311,22 @@ def get_changes(prev_params, prev_dataset, curr_dataset, flowmodel):
             "prev_depth": depth,
             "flow": flow,
             "prop_depth": prop_depth,
-            "fg_mask": fg_mask
+            "fg_mask": fg_mask,
+            "curr_masked_image": curr_masked_image  # Add the masked image to the dictionary
         })
         # print(curr_dataset[i]['cam'])
         # Clear memory and remove unwanted variables
-        del im, radius, depth, flow, prop_depth, fg_mask, points, points_with_id
+        del im, radius, depth, flow, prop_depth, fg_mask, points, points_with_id, curr_masked_image
         torch.cuda.empty_cache()
+    # only keep the points from the selected cameras
+    all_points_list = [all_points_list[i] for i in cameras_to_select]
     # Concatenate all points from different frames
     if all_points_list:
         all_points = torch.cat(all_points_list, dim=0)
         all_points = remove_low_density_points_in_grid(all_points, grid_size=0.05, k=int(len(curr_dataset)*2))
         print(f"Total points collected: {all_points.shape[0]}")        
         # Visualize the combined point cloud
-        visualize_point_cloud(all_points, seq='none')
+        # visualize_point_cloud(all_points, seq='none')
     else:
         print("No points collected!")
     return all_points, to_return    
