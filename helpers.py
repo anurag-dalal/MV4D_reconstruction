@@ -100,3 +100,4 @@ def save_params(output_params, seq, exp):
             to_save[k] = output_params[0][k]
     os.makedirs(f"./output/{exp}/{seq}", exist_ok=True)
     np.savez(f"./output/{exp}/{seq}/params", **to_save)
+

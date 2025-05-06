@@ -165,7 +165,7 @@ def train(dataset_path, previous_model_path, exp_name):
             # print(k, new_params[k].shape, new_params[k].dtype)
             # print(k, type(prev_params[k]), type(new_params[k]))
         rendervar = params2rendervar(new_params)
-        im_prev, _, _ = Renderer(raster_settings=curr_dataset[0]['cam'])(**rendervar)
+        im_prev, _, _ = Renderer(raster_settings=curr_dataset[10]['cam'])(**rendervar)
         for i in range(100):
             for j in range(len(curr_dataset)):
                 loss, new_variables = get_loss(new_params, curr_dataset[j], data_to_optimize[j], new_variables)
@@ -181,7 +181,7 @@ def train(dataset_path, previous_model_path, exp_name):
         # #     if isinstance(v, torch.Tensor):
         # #         print(f"{k}: {v.shape}, {v.dtype}, {v.device}, requires_grad={v.requires_grad}")
         # #         print(f"    NaNs: {torch.isnan(v).any().item()}, Infs: {torch.isinf(v).any().item()}")
-        im_curr, _, _ = Renderer(raster_settings=curr_dataset[0]['cam'])(**rendervar)
+        im_curr, _, _ = Renderer(raster_settings=curr_dataset[10]['cam'])(**rendervar)
         # print(im.shape, im.dtype)
         import matplotlib.pyplot as plt
 
