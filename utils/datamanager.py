@@ -4,16 +4,21 @@ import os
 
 
 class datamanager:
-    def __init__(self, data_path:str, is_numpy:bool=True, device=None):
+    def __init__(self, data_path:str, is_numpy:bool=True, from_pointcloud=False, device=None):
         self.params_from_saved = {}
         self.is_numpy = is_numpy
         self.device = device
         if self.device is None:
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.read_data(data_path)
+        if from_pointcloud:
+            self.read_data_from_pointcloud(data_path)
+        else:
+            self.read_data(data_path)
         self.data_path = data_path
         
-
+    def read_data_from_pointcloud(self, data_path:str):
+        init_pt_cld = np.load(f"{data_path}/init_pt_cld.npz")["data"]
+        
     def read_data(self, data_path:str):
         if self.is_numpy:
             saved_params = dict(np.load(data_path))
