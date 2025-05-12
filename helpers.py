@@ -2,7 +2,7 @@ import torch
 import os
 import open3d as o3d
 import numpy as np
-from diff_gaussian_rasterization import GaussianRasterizationSettings as Camera
+from diff_gaussian_rasterization_with_depth import GaussianRasterizationSettings as Camera
 
 
 def setup_camera(w, h, k, w2c, near=0.01, far=100):

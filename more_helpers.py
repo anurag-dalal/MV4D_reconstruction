@@ -1,6 +1,6 @@
 import torch
 import ptlflow
-from diff_gaussian_rasterization import GaussianRasterizer as Renderer
+from diff_gaussian_rasterization_with_depth import GaussianRasterizer as Renderer
 from helpers import params2rendervar
 import open3d as o3d
 import numpy as np

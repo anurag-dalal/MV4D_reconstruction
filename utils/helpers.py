@@ -1,6 +1,6 @@
 import torch
 import ptlflow
-from diff_gaussian_rasterization import GaussianRasterizer as Renderer
+from diff_gaussian_rasterization_with_depth import GaussianRasterizer as Renderer
 from helpers import params2rendervar
 import open3d as o3d
 import numpy as np
@@ -340,7 +340,7 @@ def remove_low_density_points_in_grid(points, grid_size=0.08, k=27):
 # strategy 1 select only n number of cameras
 def get_changes(prev_params, prev_dataset, curr_dataset, flowmodel, grid_size=0.08):
     
-    cameras_to_select = [0, 1, 2, 4, 8, 12, 16, 20, 24]
+    cameras_to_select = [0, 1, 2, 4, 8, 12, 14, 16, 18, 20, 22, 24]
     rendervar = params2rendervar(prev_params)
     rendervar['means2D'].retain_grad()
     processed_for_flow = process_input_for_flow(prev_dataset, curr_dataset)

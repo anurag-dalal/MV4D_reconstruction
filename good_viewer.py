@@ -10,7 +10,7 @@ from experiment1 import get_dataset, frame_difference_background_removal, warp_d
 from helpers import params2rendervar
 import matplotlib.pyplot as plt
 from ptlflow.utils import flow_utils
-from diff_gaussian_rasterization import GaussianRasterizer as Renderer
+from diff_gaussian_rasterization_with_depth import GaussianRasterizer as Renderer
 import copy
 
 class ImageViewer:

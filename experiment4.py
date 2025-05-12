@@ -8,7 +8,7 @@ from helpers import params2rendervar, o3d_knn, setup_camera, l1_loss_v1, l1_loss
     o3d_knn, params2rendervar, params2cpu, save_params
 from more_helpers import initialize_params, get_dataset, get_changes
 from external import calc_ssim, calc_psnr, build_rotation, update_params_and_optimizer,accumulate_mean2d_gradient, remove_points
-from diff_gaussian_rasterization import GaussianRasterizer as Renderer
+from diff_gaussian_rasterization_with_depth import GaussianRasterizer as Renderer
 
 
 def densify(params, variables, optimizer, clone=True):

@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from utils.train_utils import get_dataset_eval, params2rendervar
 from utils.train_utils import l1_loss_v1, calc_psnr, calc_ssim
-from diff_gaussian_rasterization import GaussianRasterizer as Renderer
+from diff_gaussian_rasterization_with_depth import GaussianRasterizer as Renderer
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from torchmetrics.image import PeakSignalNoiseRatio
 from pytorch_msssim import SSIM, MS_SSIM
@@ -19,6 +19,7 @@ def get_metrics_batch(gt_batch, pred_batch):
         dict: Dictionary containing calculated metrics (L1, PSNR, SSIM, LPIPS, MSSSIM)
     """
     device = pred_batch.device
+    gt_batch = gt_batch.to(device)
     
     # Initialize metric calculators
     psnr = PeakSignalNoiseRatio(data_range=1.0).to(device)
@@ -98,6 +99,13 @@ def get_metrics(params, curr_timestep, md, dataset_path, batch_size=1):
             rendervar = params2rendervar(params)
             rendervar['means2D'].retain_grad()
             pred, _, _ = Renderer(raster_settings=dataset[i]['cam'])(**rendervar)
+            # Normalize pred to [0, 1]
+            curr_id = dataset[i]['id']
+            # pred = torch.exp(params['cam_m'][curr_id])[:, None, None] * pred + params['cam_c'][curr_id][:, None, None]
+            pred_min = pred.min()
+            pred_max = pred.max()
+            pred = (pred - pred_min) / (pred_max - pred_min + 1e-8)
+
             
             # Set device if not set yet
             if device is None:

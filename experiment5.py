@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import ptlflow
-from utils.train_utils import initialize_params, o3d_knn, get_dataset, initialize_optimizer, get_loss_initial_timestep, get_loss_other_timestep,densify_initial_timestep, densify_other_timestep, get_loss_other_timestep, initialize_optimizer_other
+from utils.train_utils import initialize_params, o3d_knn, get_dataset, initialize_optimizer, get_loss_initial_timestep, get_loss_other_timestep,densify_initial_timestep, densify_other_timestep, get_loss_other_timestep, initialize_optimizer_other, initialize_optimizer_post, another_densify_initial_timestep
 from utils.metrics import get_metrics
 
 
@@ -33,7 +33,7 @@ def train(dataset_path, output_path, exp_name):
     prev_params, prev_variables = initialize_params(dataset_path, md)
     curr_timestep = 0
     prev_dataset = get_dataset(curr_timestep, md, dataset_path)
-    num_iter_per_timestep = 300
+    num_iter_per_timestep = 1000
     optimizer = initialize_optimizer(prev_params, prev_variables)
     
     start = time.time()
@@ -85,10 +85,12 @@ def train(dataset_path, output_path, exp_name):
     
             
     
-    for i in range(1, num_timesteps - 1):
+    for i in range(1, num_timesteps):
         curr_timestep = i
+
         prev_dataset = get_dataset(curr_timestep-1, md, dataset_path)
         curr_dataset = get_dataset(curr_timestep, md, dataset_path)
+        start = time.time()
         all_points, remove_points, data_to_optimize = get_changes(prev_params, prev_dataset, curr_dataset, flowmodel, manager.voxel_size)
         sq_dist, _ = o3d_knn(all_points[:, :3].cpu().numpy(), 3)
         mean3_sq_dist = sq_dist.mean(-1).clip(min=0.0000001)
@@ -116,21 +118,22 @@ def train(dataset_path, output_path, exp_name):
         optimizer = initialize_optimizer_other(new_params, new_variables)
         
         num_iter_per_timestep = 100
-        start = time.time()
         pbar = tqdm(range(num_iter_per_timestep), desc=f"Timestep {curr_timestep} pre refinement")
         running_loss = 0.0
         for j in pbar:
             batch_loss = 0.0
-            for j in range(len(curr_dataset)):
-                loss, new_variables = get_loss_other_timestep(new_params, curr_dataset[j], data_to_optimize[j], new_variables)
+            for k in range(len(curr_dataset)):
+                loss, new_variables = get_loss_other_timestep(new_params, curr_dataset[k], data_to_optimize[k], new_variables)
                 batch_loss += loss.item()
                 loss.backward()
             running_loss = 0.9 * running_loss + 0.1 * batch_loss if j > 0 else batch_loss
             pbar.set_postfix({"loss": f"{running_loss:.6f}"})
             optimizer.step()
             optimizer.zero_grad()    
-            if i % 20 == 0:
+            if j % 10 == 0:
                 new_params, new_variables = densify_other_timestep(new_params, new_variables, optimizer)
+            if j % 20 == 0:
+                new_params, new_variables = another_densify_initial_timestep(new_params, new_variables, optimizer, j, num_iter_per_timestep//4)
         
         indices_to_delete = manager.check_if_included_in_voxel(remove_points[:,:3])
         
@@ -138,7 +141,17 @@ def train(dataset_path, output_path, exp_name):
         filtered_prev_params = {}
         for k, v in prev_params.items():
             if k in ['means3D', 'rgb_colors', 'unnorm_rotations', 'logit_opacities', 'log_scales']:
-                filtered_prev_params[k] = prev_params[k][~indices_to_delete]
+                # Create a boolean mask with the same length as the parameter tensor
+                mask = torch.ones(v.shape[0], dtype=torch.bool, device=v.device)
+                
+                # Filter indices_to_delete to ensure they're within bounds
+                valid_indices = indices_to_delete[indices_to_delete < v.shape[0]]
+                
+                # Only modify the mask if there are valid indices to delete
+                if len(valid_indices) > 0:
+                    mask[valid_indices] = False  # Set mask to False for indices we want to delete
+                
+                filtered_prev_params[k] = v[mask]  # Use the mask to filter the tensor
             else:
                 filtered_prev_params[k] = prev_params[k]
         
@@ -152,22 +165,23 @@ def train(dataset_path, output_path, exp_name):
                  'means2D_gradient_accum': torch.zeros(new_params['means3D'].shape[0]).cuda().float(),
                  'denom': torch.zeros(new_params['means3D'].shape[0]).cuda().float()}
         
-        optimizer = initialize_optimizer(new_params, new_variables)
+        optimizer = initialize_optimizer_post(new_params, new_variables)
+        num_iter_per_timestep = 150
         pbar = tqdm(range(num_iter_per_timestep), desc=f"Timestep {curr_timestep} post refinement")
         running_loss = 0.0
         for j in pbar:
             batch_loss = 0.0
-            for j in range(len(curr_dataset)):
-                loss, new_variables = get_loss_initial_timestep(new_params, curr_dataset[j], new_variables)
+            for k in range(len(curr_dataset)):
+                loss, new_variables = get_loss_initial_timestep(new_params, curr_dataset[k], new_variables)
                 batch_loss += loss.item()
                 loss.backward()
             running_loss = 0.9 * running_loss + 0.1 * batch_loss if j > 0 else batch_loss
             pbar.set_postfix({"loss": f"{running_loss:.6f}"})
             optimizer.step()
             optimizer.zero_grad()    
-            if i % 10 == 0:
-                new_params, new_variables = densify_initial_timestep(new_params, new_variables, optimizer)
-                new_params, new_variables = densify_other_timestep(new_params, new_variables, optimizer) 
+            # if j % 20 == 0:
+            #     new_params, new_variables = densify_initial_timestep(new_params, new_variables, optimizer, j, num_iter_per_timestep//4)
+                # new_params, new_variables = densify_other_timestep(new_params, new_variables, optimizer) 
         
         end = time.time()
         Training_Time = end - start
@@ -176,7 +190,7 @@ def train(dataset_path, output_path, exp_name):
         Num_Params = sum(p.numel() for p in new_params.values() if p.requires_grad)
         Model_Size = Num_Params * 4 / (1024 ** 2)  # in MB
         Timestep = curr_timestep
-        Num_Iteration = num_iter_per_timestep
+        Num_Iteration = 250
         data = {
             'Timestep': Timestep,
             'Num_Iteration': Num_Iteration,
@@ -206,8 +220,8 @@ def train(dataset_path, output_path, exp_name):
 if __name__ == "__main__":
     exp_name = "start"
     dataset_name = "dynamic"
-    dataset_root_path = "/home/anurag/Datasets/dynamic/data"
-    output_path = "/home/anurag/Codes/MV4D_reconstruction/output"
+    dataset_root_path = "/mnt/c/MyFiles/Datasets/dynamic/data"
+    output_path = "/home/anurag/codes/MV4D_reconstruction/output"
     
     sequences = ["basketball", "boxes", "football", "juggle", "softball", "tennis"]
     sequences = ["basketball"]

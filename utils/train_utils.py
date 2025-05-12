@@ -1,17 +1,16 @@
 import torch
 import numpy as np
 import open3d as o3d
-from diff_gaussian_rasterization import GaussianRasterizationSettings as Camera
-from diff_gaussian_rasterization import GaussianRasterizer as Renderer
+from diff_gaussian_rasterization_with_depth import GaussianRasterizationSettings as Camera
+from diff_gaussian_rasterization_with_depth import GaussianRasterizer as Renderer
 import torch.nn.functional as func
 from torch.autograd import Variable
 from math import exp
-
 from PIL import Image
 import copy
 import os
 
-def initialize_params(dataset_path, md):
+def zeroth_initialize_params(dataset_path, md):
     init_pt_cld = np.load(f"{dataset_path}/init_pt_cld.npz")["data"]
     seg = init_pt_cld[:, 6]
     max_cams = 50
@@ -35,6 +34,32 @@ def initialize_params(dataset_path, md):
                  'means2D_gradient_accum': torch.zeros(params['means3D'].shape[0]).cuda().float(),
                  'denom': torch.zeros(params['means3D'].shape[0]).cuda().float()}
     return params, variables
+
+def other_initialize_params(prev_params, prev_variables, points):
+    sq_dist, _ = o3d_knn(points[:, :3].cpu().numpy(), 3)
+    mean3_sq_dist = sq_dist.mean(-1).clip(min=0.0000001)
+    new_numpoints = points.shape[0]
+    new_params = {
+        'means3D': torch.nn.Parameter(points[:,0:3].cuda().float().contiguous().requires_grad_(True)),
+        'rgb_colors': torch.nn.Parameter(points[:,3:6].cuda().float().contiguous().requires_grad_(True)),
+        # 'seg_colors': torch.nn.Parameter(all_points[:,3:6].cuda().float().contiguous().requires_grad_(True)),
+        'unnorm_rotations': torch.nn.Parameter(
+                                torch.tensor([1.0, 0.0, 0.0, 0.0], device='cuda')
+                                .repeat(new_numpoints, 1)
+                                .float()
+                                .contiguous()
+                                .requires_grad_(True)
+                            ),
+        'logit_opacities': torch.nn.Parameter(torch.ones(new_numpoints,1).cuda().float().contiguous().requires_grad_(True)),
+        'log_scales': torch.nn.Parameter((torch.tensor(np.tile(np.log(np.sqrt(mean3_sq_dist))[..., None], (1, 3)))).cuda().float().contiguous().requires_grad_(True)),
+        'cam_m': torch.nn.Parameter(prev_params['cam_m'].clone().cuda().float().contiguous().requires_grad_(True)),
+        'cam_c': torch.nn.Parameter(prev_params['cam_c'].clone().cuda().float().contiguous().requires_grad_(True))
+    }
+    new_variables = {'max_2D_radius': torch.zeros(new_params['means3D'].shape[0]).cuda().float(),
+                'scene_radius': torch.tensor(prev_variables['scene_radius']).clone().cuda().float(),
+                'means2D_gradient_accum': torch.zeros(new_params['means3D'].shape[0]).cuda().float(),
+                'denom': torch.zeros(new_params['means3D'].shape[0]).cuda().float()}
+    return new_params, new_variables
 
 def o3d_knn(pts, num_knn):
     indices = []
@@ -98,7 +123,7 @@ def setup_camera(w, h, k, w2c, near=0.01, far=100):
     )
     return cam
 
-def initialize_optimizer(params, variables):
+def zeroth_initialize_optimizer(params, variables):
     lrs = {
         'means3D': 0.00016 * variables['scene_radius'],
         'rgb_colors': 0.0025,
@@ -108,10 +133,10 @@ def initialize_optimizer(params, variables):
         'cam_m': 1e-4,
         'cam_c': 1e-4,
     }
-    param_groups = [{'params': [v], 'name': k, 'lr': lrs[k]} for k, v in params.items()]
+    param_groups = [{'params': [v], 'name': k, 'lr': lrs[k]*5} for k, v in params.items()]
     return torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
 
-def initialize_optimizer_other(params, variables):
+def other_initialize_optimizer_other(params, variables):
     lrs = {
         'means3D': 0.00016 * variables['scene_radius'],
         'rgb_colors': 0.0025,
@@ -124,7 +149,7 @@ def initialize_optimizer_other(params, variables):
     param_groups = [{'params': [v], 'name': k, 'lr': lrs[k] * 10} for k, v in params.items()]
     return torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
 
-def get_loss_other_timestep(params, curr_data, data_to_optimize, variables):
+def other_get_loss(params, curr_data, data_to_optimize, variables):
     losses = {}
 
     rendervar = params2rendervar(params)
@@ -140,7 +165,7 @@ def get_loss_other_timestep(params, curr_data, data_to_optimize, variables):
     variables['seen'] = seen
     return losses['im'], variables
 
-def get_loss_initial_timestep(params, curr_data, variables):
+def zeroth_get_loss(params, curr_data, variables):
     losses = {}
 
     rendervar = params2rendervar(params)
@@ -298,6 +323,7 @@ def remove_points(to_remove, params, variables, optimizer):
 
 def inverse_sigmoid(x):
     return torch.log(x / (1 - x))
+
 def update_params_and_optimizer(new_params, params, optimizer):
     for k, v in new_params.items():
         group = [x for x in optimizer.param_groups if x["name"] == k][0]
@@ -311,13 +337,63 @@ def update_params_and_optimizer(new_params, params, optimizer):
         optimizer.state[group['params'][0]] = stored_state
         params[k] = group["params"][0]
     return params
-def densify_initial_timestep(params, variables, optimizer, i):
-    if i <= 5000:
+
+def another_densify_initial_timestep(params, variables, optimizer, i, max_iters=100):
+    grad_thresh = 0.0002
+    grads = variables['means2D_gradient_accum'] / variables['denom']
+    grads[grads.isnan()] = 0.0
+    to_clone = torch.logical_and(grads >= grad_thresh, (
+                torch.max(torch.exp(params['log_scales']), dim=1).values <= 0.01 * variables['scene_radius']))
+    new_params = {k: v[to_clone] for k, v in params.items() if k not in ['cam_m', 'cam_c']}
+    params = cat_params_to_optimizer(new_params, params, optimizer)
+    num_pts = params['means3D'].shape[0]
+
+    padded_grad = torch.zeros(num_pts, device="cuda")
+    padded_grad[:grads.shape[0]] = grads
+    to_split = torch.logical_and(padded_grad >= grad_thresh,
+                                    torch.max(torch.exp(params['log_scales']), dim=1).values > 0.01 * variables[
+                                        'scene_radius'])
+    n = 2  # number to split into
+    new_params = {k: v[to_split].repeat(n, 1) for k, v in params.items() if k not in ['cam_m', 'cam_c']}
+    stds = torch.exp(params['log_scales'])[to_split].repeat(n, 1)
+    means = torch.zeros((stds.size(0), 3), device="cuda")
+    samples = torch.normal(mean=means, std=stds)
+    rots = build_rotation(params['unnorm_rotations'][to_split]).repeat(n, 1, 1)
+    new_params['means3D'] += torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1)
+    new_params['log_scales'] = torch.log(torch.exp(new_params['log_scales']) / (0.8 * n))
+    params = cat_params_to_optimizer(new_params, params, optimizer)
+    num_pts = params['means3D'].shape[0]
+
+    variables['means2D_gradient_accum'] = torch.zeros(num_pts, device="cuda")
+    variables['denom'] = torch.zeros(num_pts, device="cuda")
+    variables['max_2D_radius'] = torch.zeros(num_pts, device="cuda")
+    to_remove = torch.cat((to_split, torch.zeros(n * to_split.sum(), dtype=torch.bool, device="cuda")))
+    params, variables = remove_points(to_remove, params, variables, optimizer)
+
+    remove_threshold = 0.1 if i == max_iters//2 else 0.005
+    to_remove = (torch.sigmoid(params['logit_opacities']) < remove_threshold).squeeze()
+    if i >= max_iters*0.3:
+        big_points_ws = torch.exp(params['log_scales']).max(dim=1).values > 0.1 * variables['scene_radius']
+        to_remove = torch.logical_or(to_remove, big_points_ws)
+    params, variables = remove_points(to_remove, params, variables, optimizer)
+
+    torch.cuda.empty_cache()
+
+    if i > 0 and i % 30 == 0:
+        new_params = {'logit_opacities': inverse_sigmoid(torch.ones_like(params['logit_opacities']) * 0.01)}
+        params = update_params_and_optimizer(new_params, params, optimizer)
+
+    return params, variables
+
+def zeroth_densify(params, variables, optimizer, i, big_thres, max_iters=1000):
+    if i <= max_iters/2:
         variables = accumulate_mean2d_gradient(variables)
         grad_thresh = 0.0002
-        if (i >= 500) and (i % 100 == 0):
+        if (i >= max_iters/20) and (i % (max_iters/100) == 0):
             grads = variables['means2D_gradient_accum'] / variables['denom']
             grads[grads.isnan()] = 0.0
+            grad_thresh_dynamic = 0.9 * torch.max(grads).item()
+            grad_thresh = grad_thresh_dynamic if grad_thresh_dynamic < grad_thresh else grad_thresh_dynamic * 0.3
             to_clone = torch.logical_and(grads >= grad_thresh, (
                         torch.max(torch.exp(params['log_scales']), dim=1).values <= 0.01 * variables['scene_radius']))
             new_params = {k: v[to_clone] for k, v in params.items() if k not in ['cam_m', 'cam_c']}
@@ -346,34 +422,34 @@ def densify_initial_timestep(params, variables, optimizer, i):
             to_remove = torch.cat((to_split, torch.zeros(n * to_split.sum(), dtype=torch.bool, device="cuda")))
             params, variables = remove_points(to_remove, params, variables, optimizer)
 
-            remove_threshold = 0.25 if i == 5000 else 0.005
+            remove_threshold = 0.9 if i == max_iters/2 else 0.7
             to_remove = (torch.sigmoid(params['logit_opacities']) < remove_threshold).squeeze()
-            if i >= 3000:
-                big_points_ws = torch.exp(params['log_scales']).max(dim=1).values > 0.1 * variables['scene_radius']
+            if i >= max_iters/3:
+                big_points_ws = torch.exp(params['log_scales']).max(dim=1).values > big_thres
                 to_remove = torch.logical_or(to_remove, big_points_ws)
             params, variables = remove_points(to_remove, params, variables, optimizer)
 
             torch.cuda.empty_cache()
 
-        if i > 0 and i % 3000 == 0:
+        if i > 0 and i % (max_iters/3) == 0:
             new_params = {'logit_opacities': inverse_sigmoid(torch.ones_like(params['logit_opacities']) * 0.01)}
             params = update_params_and_optimizer(new_params, params, optimizer)
 
     return params, variables
 
-def densify_other_timestep(params, variables, optimizer, clone=True):
+def other_densify(params, variables, optimizer, clone=True):
     variables = accumulate_mean2d_gradient(variables)
     grads = variables['means2D_gradient_accum'] / variables['denom']
     grads[grads.isnan()] = 0.0
     max_grad = torch.max(grads).item()
-    to_delete_grad = 0.8 * max_grad
+    to_delete_grad = 0.98 * max_grad
     grad_mask = grads >= to_delete_grad
     grad_mask = grad_mask.unsqueeze(1)
     opacity_mask = torch.sigmoid(params['logit_opacities']) < 0.8
     large_scale_mask = torch.sum(torch.exp(params['log_scales'])**2, dim=-1) > (variables['scene_radius'] * 0.005 )**2
     large_scale_mask = large_scale_mask.unsqueeze(1)
-    print(grad_mask.shape, opacity_mask.shape, large_scale_mask.shape)
-    to_delete = torch.logical_or(grad_mask, opacity_mask)
+    # print(grad_mask.shape, opacity_mask.shape, large_scale_mask.shape)
+    to_delete = torch.logical_and(grad_mask, opacity_mask)
     to_delete = torch.logical_or(to_delete, large_scale_mask)
     # to_delete = to_delete.repeat(1, 3)
     to_delete = to_delete.squeeze(1)
