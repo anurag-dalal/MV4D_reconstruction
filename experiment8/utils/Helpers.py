@@ -26,3 +26,26 @@ def setup_camera(w, h, k, w2c, near=0.01, far=100):
         prefiltered=False
     )
     return cam
+
+def visulaize_point_cloud_6d_torch_array(point_cloud_data):
+    """
+    Visualize a point cloud using Open3D.
+    Args:
+        point_cloud_data (torch.Tensor): The point cloud data as a tensor of shape (N, 6).
+            The first three columns are the x, y, z coordinates, and the last three columns are the RGB colors.
+    """
+    import open3d as o3d
+    import numpy as np
+
+    # Convert the point cloud data to a numpy array
+    point_cloud_data = point_cloud_data.cpu().numpy()
+    
+    # Create an Open3D PointCloud object
+    pcd = o3d.geometry.PointCloud()
+    
+    # Set the points and colors
+    pcd.points = o3d.utility.Vector3dVector(point_cloud_data[:, :3])
+    pcd.colors = o3d.utility.Vector3dVector(point_cloud_data[:, 3:])
+    
+    # Visualize the point cloud
+    o3d.visualization.draw_geometries([pcd])

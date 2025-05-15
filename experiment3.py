@@ -23,9 +23,9 @@ def get_dataset(t, md, seq):
         w, h, k, w2c = md['w'], md['h'], md['k'][t][c], md['w2c'][t][c]
         cam = setup_camera(w, h, k, w2c, near=1.0, far=100)
         fn = md['fn'][t][c]
-        im = np.array(copy.deepcopy(Image.open(f"/home/anurag/Datasets/dynamic/data/{seq}/ims/{fn}")))
+        im = np.array(copy.deepcopy(Image.open(f"/mnt/c/MyFiles/Datasets/dynamic/data/{seq}/ims/{fn}")))
         im = torch.tensor(im).float().cuda().permute(2, 0, 1) / 255
-        seg = np.array(copy.deepcopy(Image.open(f"/home/anurag/Datasets/dynamic/data/{seq}/seg/{fn.replace('.jpg', '.png')}"))).astype(np.float32)
+        seg = np.array(copy.deepcopy(Image.open(f"/mnt/c/MyFiles/Datasets/dynamic/data/{seq}/seg/{fn.replace('.jpg', '.png')}"))).astype(np.float32)
         seg = torch.tensor(seg).float().cuda()
         seg_col = torch.stack((seg, torch.zeros_like(seg), 1 - seg))
         dataset.append({'cam': cam, 'im': im, 'seg': seg_col, 'id': c})
@@ -40,7 +40,7 @@ def get_batch(todo_dataset, dataset):
 
 
 def initialize_params(seq, md):
-    init_pt_cld = np.load(f"/home/anurag/Datasets/dynamic/data/{seq}/init_pt_cld.npz")["data"]
+    init_pt_cld = np.load(f"/mnt/c/MyFiles/Datasets/dynamic/data/{seq}/init_pt_cld.npz")["data"]
     seg = init_pt_cld[:, 6]
     max_cams = 50
     sq_dist, _ = o3d_knn(init_pt_cld[:, :3], 3)
@@ -950,7 +950,7 @@ def visualize_point_cloud(points, seq="unknown"):
                                             point_show_normal=False)
 
 def train(seq, exp):
-    md = json.load(open(f"/home/anurag/Datasets/dynamic/data/{seq}/train_meta.json", 'r'))  # metadata
+    md = json.load(open(f"/mnt/c/MyFiles/Datasets/dynamic/data/{seq}/train_meta.json", 'r'))  # metadata
     num_timesteps = len(md['fn'])
     
     # Check if we have a saved model to initialize from

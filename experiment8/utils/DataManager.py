@@ -57,8 +57,24 @@ class DynamicGaussianDatasetManager():
                 fn = md['fn'][t][c]
                 im = np.array(copy.deepcopy(Image.open(f"{self.dataset_path}/ims/{fn}")))
                 im = torch.tensor(im).float().cuda().permute(2, 0, 1) / 255
+                im = im.to(self.device)
                 dataset.append({'cam': cam, 'im': im, 'id': c})
             return dataset
+    def get_dataset_ij(self, i, j, train=True):
+        if self.dataset == 'dynamic':
+            if train:
+                md = self.train_md
+            else:
+                md = self.test_md
+            t = i
+            c = j
+            w, h, k, w2c = md['w'], md['h'], md['k'][t][c], md['w2c'][t][c]
+            cam = setup_camera(w, h, k, w2c, near=1.0, far=100)
+            fn = md['fn'][t][c]
+            im = np.array(copy.deepcopy(Image.open(f"{self.dataset_path}/ims/{fn}")))
+            im = torch.tensor(im).float().cuda().permute(2, 0, 1) / 255
+            im = im.to(self.device)
+            return {'cam': cam, 'im': im, 'id': c}
         
     def get_changes():
         pass

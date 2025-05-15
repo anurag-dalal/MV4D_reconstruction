@@ -56,7 +56,7 @@ class VoxelGridManager:
         return np.array(result_indices, dtype=int)
     
     def initialize_points_from_pointcloud(self, data_path):
-        init_pt_cld = np.load(f"{data_path}/init_pt_cld.npz")["data"]
+        init_pt_cld = np.load(data_path)["data"]
         self.points = init_pt_cld[:, :3]
         self.colors = init_pt_cld[:, 3:6]
         self._update_voxel_grid()

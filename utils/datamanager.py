@@ -92,3 +92,47 @@ class datamanager:
     
     def save_data(self, data_path:str):
         torch.save(self.params_from_saved, data_path)
+
+
+import json
+from utils.train_utils import setup_camera
+import copy
+from PIL import Image
+class DynamicGaussianDatasetManager():
+    def __init__(self, dataset_path, device=None, dataset='dynamic'):
+        
+        self.dataset_path = dataset_path
+        if dataset == 'dynamic':
+            self.dataset = 'dynamic'                                                    
+            self.train_md = json.load(open(f"{dataset_path}/train_meta.json", 'r'))
+            self.test_md = json.load(open(f"{dataset_path}/test_meta.json", 'r'))
+            self.pointcloud_path = f"{self.dataset_path}/init_pt_cld.npz"
+            
+            self.train_num_cams = len(self.train_md['fn'][0])
+            self.test_num_cams = len(self.test_md['fn'][0])
+            self.num_timesteps = len(self.train_md['fn'])
+        if device  is not None:
+            self.device = device
+        else:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    
+    def get_dataset(self, timestep, train=True):
+        if self.dataset == 'dynamic':
+            if train:
+                md = self.train_md
+            else:
+                md = self.test_md
+            t = timestep
+            dataset = []
+            for c in range(len(md['fn'][t])):
+                w, h, k, w2c = md['w'], md['h'], md['k'][t][c], md['w2c'][t][c]
+                cam = setup_camera(w, h, k, w2c, near=1.0, far=100)
+                fn = md['fn'][t][c]
+                im = np.array(copy.deepcopy(Image.open(f"{self.dataset_path}/ims/{fn}")))
+                im = torch.tensor(im).float().cuda().permute(2, 0, 1) / 255
+                dataset.append({'cam': cam, 'im': im, 'id': c})
+            return dataset
+        
+    def get_changes():
+        pass
