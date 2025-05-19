@@ -10,9 +10,7 @@ from sklearn.neighbors import NearestNeighbors
 import open3d as o3d
 import ptlflow
 class GaussianModel():
-    def __init__(self, params, variables):
-        self.params = params
-        self.variables = variables
+
     def o3d_knn(self, pts, num_knn):
         indices = []
         sq_dists = []
@@ -24,26 +22,43 @@ class GaussianModel():
             indices.append(i[1:])
             sq_dists.append(d[1:])
         return np.array(sq_dists), np.array(indices)
-    def __init__(self, point_cloud_data, max_cams, avg_distance, dyanmic_dataset_manager):
+    
+    def __init__(self, point_cloud_data, dyanmic_dataset_manager, max_cams=None, cam_m=None, cam_c=None):
+        if isinstance(point_cloud_data, torch.Tensor):
+            point_cloud_data = point_cloud_data.cpu().numpy()
         sq_dist, _ = self.o3d_knn(point_cloud_data[:, :3], 3)
         mean3_sq_dist = sq_dist.mean(-1).clip(min=0.0000001)
+
+        if cam_m is None or cam_c is None:
+            cam_m = np.zeros((max_cams, 3))
+            cam_c = np.zeros((max_cams, 3))
+
         self.params = {
             'means3D': point_cloud_data[:, :3],
             'rgb_colors': point_cloud_data[:, 3:6],
             'unnorm_rotations': np.tile([1, 0, 0, 0], (point_cloud_data.shape[0], 1)),
             'logit_opacities': np.ones((point_cloud_data.shape[0], 1)),
             'log_scales': np.tile(np.log(np.sqrt(mean3_sq_dist))[..., None], (1, 3)),
-            'cam_m': np.zeros((max_cams, 3)),
-            'cam_c': np.zeros((max_cams, 3)),
+            'cam_m': cam_m,
+            'cam_c': cam_c,
         }
-        self.params = {k: torch.nn.Parameter(torch.tensor(v).cuda().float().contiguous().requires_grad_(True)) for k, v in
-              self.params.items()}
-        self.cam_centers = np.linalg.inv(dyanmic_dataset_manager.train_md['w2c'][0])[:, :3, 3]  # Get scene radius
-        self.scene_radius = 1.1 * np.max(np.linalg.norm(self.cam_centers - np.mean(self.cam_centers, 0)[None], axis=-1))
-        self.variables = {'max_2D_radius': torch.zeros(self.params['means3D'].shape[0]).cuda().float(),
-                 'scene_radius': self.scene_radius,
-                 'means2D_gradient_accum': torch.zeros(self.params['means3D'].shape[0]).cuda().float(),
-                 'denom': torch.zeros(self.params['means3D'].shape[0]).cuda().float()}
+
+        self.params = {
+            k: torch.nn.Parameter(torch.tensor(v).cuda().float().contiguous().requires_grad_(True))
+            for k, v in self.params.items()
+        }
+
+        self.cam_centers = np.linalg.inv(dyanmic_dataset_manager.train_md['w2c'][0])[:, :3, 3]
+        self.scene_radius = 1.1 * np.max(
+            np.linalg.norm(self.cam_centers - np.mean(self.cam_centers, 0)[None], axis=-1)
+        )
+        self.variables = {
+            'max_2D_radius': torch.zeros(self.params['means3D'].shape[0]).cuda().float(),
+            'scene_radius': self.scene_radius,
+            'means2D_gradient_accum': torch.zeros(self.params['means3D'].shape[0]).cuda().float(),
+            'denom': torch.zeros(self.params['means3D'].shape[0]).cuda().float()
+        }
+
     def params2rendervar(self):
         rendervar = {
             'means3D': self.params['means3D'],
@@ -97,7 +112,7 @@ class GaussianModelTrainer():
 
         
         
-        self.gm = GaussianModel(self.point_cloud_data, self.max_cams, self.avg_distance, self.dyanmic_dataset_manager)
+        self.gm = GaussianModel(point_cloud_data=self.point_cloud_data, dyanmic_dataset_manager=self.dyanmic_dataset_manager, max_cams=self.max_cams)
         self.ssim = SSIM(data_range=1.0, size_average=False, channel=3).to(self.dyanmic_dataset_manager.device)
 
         self.flowmodel = ptlflow.get_model("raft", ckpt_path="things")
@@ -118,6 +133,18 @@ class GaussianModelTrainer():
             'cam_c': 1e-4,
         }
         param_groups = [{'params': [v], 'name': k, 'lr': lrs[k]*scaling_factor} for k, v in self.gm.params.items()]
+        return torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
+    def initialize_optimizer_for_selected_points(self, scaling_factor=1.0):
+        lrs = {
+            'means3D': 0.00016 * self.selected_gm.variables['scene_radius'],
+            'rgb_colors': 0.0025,
+            'unnorm_rotations': 0.001,
+            'logit_opacities': 0.05,
+            'log_scales': 0.001,
+            'cam_m': 1e-4,
+            'cam_c': 1e-4,
+        }
+        param_groups = [{'params': [v], 'name': k, 'lr': lrs[k]*scaling_factor} for k, v in self.selected_gm.params.items()]
         return torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
     
     def l1_loss_v1(self, x, y):
@@ -145,6 +172,9 @@ class GaussianModelTrainer():
     
     def update_variables(self, variables):
         self.gm.variables = variables
+
+    def update_variables_for_selected_points(self, variables):
+        self.selected_gm.variables = variables
 
     def save_model(self, path):
         self.gm.save(path)
@@ -369,12 +399,11 @@ class GaussianModelTrainer():
 
         return filtered_points
 
-    def get_changes(self, i, cameras_to_select=0.4):
+    def get_changes(self, n, cameras_to_select=0.4):
         """
         Get the changes between two timesteps.
         Args:
-            i (int): The first timestep.
-            j (int): The second timestep.
+            n (int): The timestep.
             cameras_to_select (float): The fraction of cameras to select for the change detection.
         Returns:
             all_points (torch.Tensor): The points that are not occluded in both timesteps.
@@ -385,17 +414,18 @@ class GaussianModelTrainer():
         cameras = np.random.rand(int(self.dyanmic_dataset_manager.train_num_cams*cameras_to_select)) * self.dyanmic_dataset_manager.train_num_cams
         cameras = np.unique(cameras).astype(int)
         cameras = cameras.tolist()
+        print(f"Selected cameras: {cameras}")
 
         # Get the dataset for the two timesteps
-        dataset_prev = self.dyanmic_dataset_manager.get_dataset(i-1, train=True)
-        dataset_curr = self.dyanmic_dataset_manager.get_dataset(i, train=True)
+        dataset_prev = self.dyanmic_dataset_manager.get_dataset(n-1, train=True)
+        dataset_curr = self.dyanmic_dataset_manager.get_dataset(n, train=True)
         to_return = []
         # Initialize a list to collect all points from different frames
         all_points_list = []
         remove_from_grid_list = []
         for i in range(self.dyanmic_dataset_manager.train_num_cams):
             with torch.no_grad():
-                im_prev, radi, depth_prev = self.gm.render(dataset_prev[i-1]['cam'])
+                im_prev, radi, depth_prev = self.gm.render(dataset_prev[i]['cam'])
                 predictions = self.flowmodel({"images": torch.stack([dataset_curr[i]['im'], dataset_prev[i]['im']], dim=0).unsqueeze(0)})
                 flow = predictions["flows"][0, 0]
                 predictions = self.flowmodel({"images": torch.stack([ dataset_prev[i]['im'], dataset_curr[i]['im']], dim=0).unsqueeze(0)})
@@ -424,10 +454,79 @@ class GaussianModelTrainer():
             })
         
         all_points = torch.cat(all_points_list, dim=0)
-        # all_points = self.remove_low_density_points_in_grid(all_points, grid_size=self.avg_distance, k=int(len(dataset_curr)*cameras_to_select))
+        all_points = self.remove_low_density_points_in_grid(all_points, grid_size=self.avg_distance, k=int(len(dataset_curr)*cameras_to_select*0.5))
 
         remove_points = torch.cat(remove_from_grid_list, dim=0)
         # remove_points = self.remove_low_density_points_in_grid(remove_points, grid_size=self.avg_distance, k=int(len(dataset_curr)*cameras_to_select))
 
         return all_points, remove_points, to_return
+    def initialize_gaussian_for_selected_points(self, all_points):
+        """
+        Initialize the Gaussian model for the selected points.
+        Args:
+            all_points (torch.Tensor): The points to optimize.
+            data_to_optimize (list): The data to optimize.
+            camid (int): The camera ID.
+        """
+        
+        # Initialize the Gaussian model with the selected points
+        self.selected_gm = GaussianModel(point_cloud_data=all_points, dyanmic_dataset_manager=self.dyanmic_dataset_manager, cam_m=torch.clone(self.gm.params['cam_m']), cam_c=torch.clone(self.gm.params['cam_c']))
+
+    def train_for_selected_points(self, all_points, data_to_optimize, timestep, camid):
+
+        """
+        Train the model for the selected points.
+        Args:
+            all_points (torch.Tensor): The points to optimize.
+            data_to_optimize (list): The data to optimize.
+            camid (int): The camera ID.
+        Returns:
+            loss (torch.Tensor): The loss.
+            variables (dict): The variables.
+        """
+        # Get the dataset for the two timesteps
+        curr_data = self.dyanmic_dataset_manager.get_dataset_ij(timestep, camid, train=True)
+        rendervar = self.selected_gm.params2rendervar()
+        rendervar['means2D'].retain_grad()
+        im, radius, _, = Renderer(raster_settings=curr_data['cam'])(**rendervar)
+        curr_id = curr_data['id']
+        im = torch.exp(self.selected_gm.params['cam_m'][curr_id])[:, None, None] * im + self.selected_gm.params['cam_c'][curr_id][:, None, None]
+        loss = 0.8 * self.l1_loss_v1(im, data_to_optimize[camid]['curr_masked_image'])
+        self.selected_gm.variables['means2D'] = rendervar['means2D']  # Gradient only accum from colour render for densification
+
+        
+        seen = radius > 0
+        self.selected_gm.variables['max_2D_radius'][seen] = torch.max(radius[seen], self.selected_gm.variables['max_2D_radius'][seen])
+        self.selected_gm.variables['seen'] = seen
+        return loss, self.selected_gm.variables
+    
+    def merge_gaussian_for_selected_points(self):
+        """
+        Merge the Gaussian model for the selected points.
+        """
+        self.gm.params['means3D'] = torch.cat([self.gm.params['means3D'], self.selected_gm.params['means3D']], dim=0)
+        self.gm.params['rgb_colors'] = torch.cat([self.gm.params['rgb_colors'], self.selected_gm.params['rgb_colors']], dim=0)
+        self.gm.params['unnorm_rotations'] = torch.cat([self.gm.params['unnorm_rotations'], self.selected_gm.params['unnorm_rotations']], dim=0)
+        self.gm.params['logit_opacities'] = torch.cat([self.gm.params['logit_opacities'], self.selected_gm.params['logit_opacities']], dim=0)
+        self.gm.params['log_scales'] = torch.cat([self.gm.params['log_scales'], self.selected_gm.params['log_scales']], dim=0)
+        self.gm.params['cam_m'] = (self.gm.params['cam_m'] + self.selected_gm.params['cam_m']) / 2
+        self.gm.params['cam_c'] = (self.gm.params['cam_c'] + self.selected_gm.params['cam_c']) / 2
+
+        self.gm.variables = {'max_2D_radius': torch.zeros(self.gm.params['means3D'].shape[0]).cuda().float(),
+                 'scene_radius': self.gm.scene_radius,
+                 'means2D_gradient_accum': torch.zeros(self.gm.params['means3D'].shape[0]).cuda().float(),
+                 'denom': torch.zeros(self.gm.params['means3D'].shape[0]).cuda().float()}
+        
+        self.gm.params = {k: torch.nn.Parameter(torch.tensor(v, dtype=torch.float32, device='cuda', requires_grad=True).contiguous()) for k, v in self.gm.params.items()}
+    
+    def remove_points_from_original(self, remove_points):
+        """
+        Remove points from the original point cloud.
+        Args:
+            remove_points (torch.Tensor): The points to remove.
+        """
+        
+
+
+        
 

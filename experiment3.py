@@ -986,7 +986,7 @@ def train(seq, exp):
 
 
 if __name__ == "__main__":
-    exp_name = "exp1"
-    for sequence in ["football"]:
+    exp_name = "baseline_training"
+    for sequence in ["basketball"]:
         train(sequence, exp_name)
         torch.cuda.empty_cache()
