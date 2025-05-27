@@ -3,6 +3,7 @@ import torch
 from diff_gaussian_rasterization_with_depth import GaussianRasterizationSettings as Camera
 
 def setup_camera(w, h, k, w2c, near=0.01, far=100):
+    
     fx, fy, cx, cy = k[0][0], k[1][1], k[0][2], k[1][2]
     w2c = torch.tensor(w2c).cuda().float()
     cam_center = torch.inverse(w2c)[:3, 3]

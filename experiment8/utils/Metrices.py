@@ -43,7 +43,7 @@ class Metrics():
         for i in range(len(dataset)):
             gt = dataset[i]['im']
             pred,_, _ = model.gm.render(dataset[i]['cam'])
-
+            pred = torch.clip(pred, min=0.0, max=1.0)
             gt = gt.unsqueeze(0).to(self.device)
             pred = pred.unsqueeze(0).to(self.device)
 

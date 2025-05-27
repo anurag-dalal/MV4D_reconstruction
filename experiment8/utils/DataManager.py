@@ -78,3 +78,15 @@ class DynamicGaussianDatasetManager():
         
     def get_changes():
         pass
+    def file_names(self, timestep, train=True):
+        if self.dataset == 'dynamic':
+            if train:
+                md = self.train_md
+            else:
+                md = self.test_md
+            t = timestep
+            file_list = []
+            for c in range(len(md['fn'][t])):
+                fn = md['fn'][t][c]
+                file_list.append(f"{self.dataset_path}/ims/{fn}")
+        return file_list
